@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Exec(ls)",
+      "Exec(Get-ChildItem)",
+      "Exec(flutter analyze)",
+      "Exec(flutter)",
+      "Exec(dart analyze)",
+      "Exec(dart)",
+      "Exec(where flutter)"
+    ]
+  }
+}
