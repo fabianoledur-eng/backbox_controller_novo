@@ -4,7 +4,10 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'configs.dart';
+import 'midi_communication.dart';
+import 'pedaleira_state_manager.dart';
 
 class ControllerScreen extends StatefulWidget {
   const ControllerScreen({super.key});
@@ -14,49 +17,50 @@ class ControllerScreen extends StatefulWidget {
 }
 
 class _ControllerScreenState extends State<ControllerScreen> {
-  BluetoothDevice? _device;
-  BluetoothCharacteristic? _midiChar;
-  int _activePresetIndex = 0;
+  final MidiCommunicationService _midiService = MidiCommunicationService();
+  late PedaleiraStateManager _stateManager;
+  
   String _status = "Pedaleira Desconectada";
   int? _blockIdPiscando;
 
   // Controle da busca/conexão Bluetooth
   StreamSubscription<List<ScanResult>>? _scanSub;
-  StreamSubscription<BluetoothConnectionState>? _connSub;
+  StreamSubscription<void>? _connectionLostSub;
   bool _ocupado = false; // evita várias buscas/conexões ao mesmo tempo
 
   final List<PresetConfig> _presets = [
-    PresetConfig(label: 'PRESET A', subLabel: 'Preset 01', blackboxPresetNumber: 0, ledColor: const Color(0xff00e5ff), initialEffectsState: [false, false, false, false, false, false]),
-    PresetConfig(label: 'PRESET B', subLabel: 'Preset 02', blackboxPresetNumber: 1, ledColor: Colors.green, initialEffectsState: [false, false, false, false, false, false]),
-    PresetConfig(label: 'PRESET C', subLabel: 'Preset 03', blackboxPresetNumber: 2, ledColor: Colors.purple, initialEffectsState: [false, false, false, false, false, false]),
-    PresetConfig(label: 'PRESET D', subLabel: 'Preset 04', blackboxPresetNumber: 3, ledColor: Colors.red, initialEffectsState: [false, false, false, false, false, false]),
-    PresetConfig(label: 'PRESET E', subLabel: 'Preset 05', blackboxPresetNumber: 4, ledColor: Colors.orange, initialEffectsState: [false, false, false, false, false, false]),
-    PresetConfig(label: 'PRESET F', subLabel: 'Preset 06', blackboxPresetNumber: 5, ledColor: Colors.yellow, initialEffectsState: [false, false, false, false, false, false]),
-    PresetConfig(label: 'PRESET G', subLabel: 'Preset 07', blackboxPresetNumber: 6, ledColor: Colors.pink, initialEffectsState: [false, false, false, false, false, false]),
-    PresetConfig(label: 'PRESET H', subLabel: 'Preset 08', blackboxPresetNumber: 7, ledColor: Colors.blue, initialEffectsState: [false, false, false, false, false, false]),
-  ];
-
-  final List<EffectBlockConfig> _effectsChain = [
-    EffectBlockConfig(name: 'FX', ccNumber: 0, activeColor: Colors.green, isEnabled: false),
-    EffectBlockConfig(name: 'AMP', ccNumber: 1, activeColor: Colors.red, isEnabled: false),
-    EffectBlockConfig(name: 'MOD', ccNumber: 2, activeColor: Colors.blue, isEnabled: false),
-    EffectBlockConfig(name: 'DLY', ccNumber: 3, activeColor: Colors.purple, isEnabled: false),
-    EffectBlockConfig(name: 'REV', ccNumber: 4, activeColor: Colors.teal, isEnabled: false),
-    EffectBlockConfig(name: 'CAB', ccNumber: 5, activeColor: Colors.orange, isEnabled: false),
+    PresetConfig(label: 'PRESET A', subLabel: 'Preset 01', blackboxPresetNumber: 0, ledColor: const Color(0xff00ff88), initialEffectsState: [false, false, false, false, false, false]),
+    PresetConfig(label: 'PRESET B', subLabel: 'Preset 02', blackboxPresetNumber: 1, ledColor: const Color(0xff9d4edd), initialEffectsState: [false, false, false, false, false, false]),
+    PresetConfig(label: 'PRESET C', subLabel: 'Preset 03', blackboxPresetNumber: 2, ledColor: const Color(0xff00d4ff), initialEffectsState: [false, false, false, false, false, false]),
+    PresetConfig(label: 'PRESET D', subLabel: 'Preset 04', blackboxPresetNumber: 3, ledColor: const Color(0xffff6b35), initialEffectsState: [false, false, false, false, false, false]),
+    PresetConfig(label: 'PRESET E', subLabel: 'Preset 05', blackboxPresetNumber: 4, ledColor: const Color(0xffff006e), initialEffectsState: [false, false, false, false, false, false]),
+    PresetConfig(label: 'PRESET F', subLabel: 'Preset 06', blackboxPresetNumber: 5, ledColor: const Color(0xff8338ec), initialEffectsState: [false, false, false, false, false, false]),
+    PresetConfig(label: 'PRESET G', subLabel: 'Preset 07', blackboxPresetNumber: 6, ledColor: const Color(0xff3a86ff), initialEffectsState: [false, false, false, false, false, false]),
+    PresetConfig(label: 'PRESET H', subLabel: 'Preset 08', blackboxPresetNumber: 7, ledColor: const Color(0xfffb5607), initialEffectsState: [false, false, false, false, false, false]),
   ];
 
   @override
   void initState() {
     super.initState();
-    _carregarPresetsSalvos();
+    _stateManager = PedaleiraStateManager(_midiService);
+    _stateManager.initializePresets(_presets);
+    _initializeStateListeners();
+    _connectionLostSub = _midiService.connectionLostStream.listen((_) {
+      _stateManager.setConnectedState(false);
+      _setStatus("Conexão perdida. Toque no Bluetooth para reconectar");
+    });
+    // Carrega os presets salvos de forma assíncrona sem bloquear a UI
+    Future.microtask(() => _carregarPresetsSalvos());
   }
 
   @override
   void dispose() {
     _scanSub?.cancel();
-    _connSub?.cancel();
+    _connectionLostSub?.cancel();
+    _stateManager.removeListener(_onStateChanged);
+    _stateManager.dispose();
     FlutterBluePlus.stopScan();
-    _device?.disconnect();
+    _midiService.disconnect().whenComplete(_midiService.dispose);
     super.dispose();
   }
 
@@ -65,101 +69,162 @@ class _ControllerScreenState extends State<ControllerScreen> {
     setState(() => _status = texto);
   }
 
-  Future<void> _carregarPresetsSalvos() async {
-    final prefs = await SharedPreferences.getInstance();
-    final String? presetsJson = prefs.getString('saved_presets_data');
+  void _onStateChanged() {
+    if (mounted) setState(() {});
+  }
 
-    if (presetsJson != null) {
-      try {
+  void _initializeStateListeners() {
+    _stateManager.addListener(_onStateChanged);
+  }
+
+  Future<void> _carregarPresetsSalvos() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final String? presetsJson = prefs.getString('saved_presets_data');
+
+      if (presetsJson != null && presetsJson.isNotEmpty) {
         final List<dynamic> decodedList = jsonDecode(presetsJson);
-        if (!mounted) return;
-        setState(() {
-          for (int i = 0; i < decodedList.length && i < _presets.length; i++) {
-            _presets[i].label = decodedList[i]['label'] ?? _presets[i].label;
-            _presets[i].subLabel = decodedList[i]['subLabel'] ?? _presets[i].subLabel;
-            _presets[i].blackboxPresetNumber = decodedList[i]['number'] ?? _presets[i].blackboxPresetNumber;
+        bool hasChanges = false;
+        
+        for (int i = 0; i < decodedList.length && i < _presets.length; i++) {
+          final newLabel = (decodedList[i]['label'] as String?) ?? _presets[i].label;
+          final newSubLabel = (decodedList[i]['subLabel'] as String?) ?? _presets[i].subLabel;
+          final newNumber = (decodedList[i]['number'] as int?) ?? _presets[i].blackboxPresetNumber;
+          final newColor = decodedList[i]['color'] != null 
+              ? Color(decodedList[i]['color'] as int) 
+              : _presets[i].ledColor;
+          
+          // Só atualiza se houver mudanças
+          if (_presets[i].label != newLabel || 
+              _presets[i].subLabel != newSubLabel || 
+              _presets[i].blackboxPresetNumber != newNumber ||
+              _presets[i].ledColor != newColor) {
+            _presets[i].label = newLabel;
+            _presets[i].subLabel = newSubLabel;
+            _presets[i].blackboxPresetNumber = newNumber;
+            _presets[i].ledColor = newColor;
+            hasChanges = true;
           }
-        });
-      } catch (e) {
-        debugPrint("Erro ao carregar dados salvos: $e");
+        }
+        
+        // Só atualiza o state manager se houver mudanças
+        if (hasChanges) {
+          await _stateManager.initializePresets(_presets);
+        }
       }
+    } catch (e) {
+      debugPrint("Erro ao carregar dados salvos: $e");
     }
   }
 
   Future<void> _salvarPresetsNoDispositivo() async {
-    final prefs = await SharedPreferences.getInstance();
-    final List<Map<String, dynamic>> listaParaSalvar = _presets
-        .map((p) => {
-              'label': p.label,
-              'subLabel': p.subLabel,
-              'number': p.blackboxPresetNumber,
-            })
-        .toList();
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final List<Map<String, dynamic>> listaParaSalvar = _presets
+          .map((p) => {
+                'label': p.label,
+                'subLabel': p.subLabel,
+                'number': p.blackboxPresetNumber,
+                'color': p.ledColor.toARGB32(),
+              })
+          .toList();
 
-    await prefs.setString('saved_presets_data', jsonEncode(listaParaSalvar));
+      await prefs.setString('saved_presets_data', jsonEncode(listaParaSalvar));
+    } catch (e) {
+      debugPrint("Erro ao salvar presets: $e");
+    }
+  }
+
+  Future<bool> _requestBluetoothPermissions() async {
+    // As permissões em tempo de execução só existem no Android (12+ usa SCAN/CONNECT).
+    // No iPhone o próprio sistema pergunta na primeira conexão.
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return true;
+
+    final Map<Permission, PermissionStatus> statuses = await [
+      Permission.bluetoothScan,
+      Permission.bluetoothConnect,
+    ].request();
+
+    final bool allGranted = statuses.values.every((status) => status.isGranted);
+
+    if (!allGranted) {
+      debugPrint('❌ Permissões negadas: ${statuses.entries.where((e) => !e.value.isGranted).map((e) => e.key).join(', ')}');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text('Permita o acesso a "Dispositivos próximos" para conectar à pedaleira.'),
+            duration: const Duration(seconds: 4),
+            action: SnackBarAction(
+              label: 'Configurações',
+              onPressed: () {
+                openAppSettings();
+              },
+            ),
+          ),
+        );
+      }
+      return false;
+    }
+
+    debugPrint('✅ Todas as permissões Bluetooth concedidas');
+    return true;
   }
 
   // Botão de Bluetooth: conecta se estiver desconectado, desconecta se estiver conectado
   Future<void> _conectarBlackbox() async {
     if (_ocupado) return;
-    if (_device != null || _midiChar != null) {
-      await _desconectar();
+
+    if (_midiService.isConnected) {
+      _ocupado = true;
+      _setStatus("Desconectando...");
+      await _midiService.disconnect();
+      _stateManager.setConnectedState(false);
+      _setStatus("Pedaleira Desconectada");
+      _ocupado = false;
       return;
     }
 
     _ocupado = true;
     try {
-      // 1. O aparelho tem Bluetooth?
-      if (!await FlutterBluePlus.isSupported) {
-        _setStatus("Este aparelho não tem Bluetooth");
+      // 1. Permissões
+      if (!await _requestBluetoothPermissions()) {
+        _setStatus("Permissões negadas");
         return;
       }
 
-      // 2. O Bluetooth está ligado? (no Android tenta ligar sozinho)
+      // 2. O aparelho tem Bluetooth?
+      if (!await FlutterBluePlus.isSupported) {
+        _setStatus("Bluetooth não suportado");
+        return;
+      }
+
+      // 3. O Bluetooth está ligado? (no Android tenta ligar sozinho)
       if (!await _bluetoothLigado()) {
         _setStatus("Ligue o Bluetooth do celular e tente de novo");
         return;
       }
 
-      // 3. Procura a pedaleira (máx. 6 segundos)
+      // 4. Procura a pedaleira (máx. 8 segundos)
       _setStatus("Buscando...");
       final BluetoothDevice? encontrado = await _procurarPedaleira();
       if (encontrado == null) {
-        _setStatus("Pedaleira não encontrada. Ligue-a e tente de novo");
+        _setStatus("Nenhum dispositivo encontrado. Ligue a pedaleira e tente de novo");
         return;
       }
 
-      // 4. Conecta
-      _device = encontrado;
+      // 5. Conecta e encontra o canal MIDI
       _setStatus("Conectando...");
-      await encontrado.connect(timeout: const Duration(seconds: 10));
-
-      // 5. Avisa se a conexão cair (pedaleira desligada, fora de alcance...)
-      await _connSub?.cancel();
-      _connSub = encontrado.connectionState.listen((estado) {
-        if (estado == BluetoothConnectionState.disconnected && _device != null) {
-          _connSub?.cancel();
-          _connSub = null;
-          if (!mounted) return;
-          setState(() {
-            _device = null;
-            _midiChar = null;
-            _status = "Conexão perdida. Toque no Bluetooth para reconectar";
-          });
-        }
-      });
-
-      // 6. Encontra o canal MIDI
-      await _acharMidi();
+      await _connectToDevice(encontrado);
     } catch (e) {
-      debugPrint("Erro ao conectar: $e");
-      await _desconectar(mensagem: "Falha ao conectar. Tente novamente");
+      debugPrint('❌ Bluetooth: Erro ao buscar: $e');
+      _setStatus("Erro ao buscar. Tente novamente");
     } finally {
       _ocupado = false;
     }
   }
 
   Future<bool> _bluetoothLigado() async {
+    // Logo que o app abre o estado pode ainda ser "unknown": espera a resposta real
     BluetoothAdapterState estado = await FlutterBluePlus.adapterState
         .where((s) => s != BluetoothAdapterState.unknown)
         .first
@@ -194,6 +259,7 @@ class _ControllerScreenState extends State<ControllerScreen> {
                   : r.device.platformName)
               .toUpperCase();
           if ((nome.contains('M-VAVE') || nome.contains('BLACKBOX')) && !completer.isCompleted) {
+            debugPrint('✅ Bluetooth: Dispositivo alvo encontrado: $nome');
             completer.complete(r.device);
             return;
           }
@@ -205,10 +271,9 @@ class _ControllerScreenState extends State<ControllerScreen> {
     );
 
     try {
-      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 6));
-      // startScan com timeout só termina quando a busca acaba;
-      // se a pedaleira foi achada antes, o completer já tem o resultado.
-      return await completer.future.timeout(const Duration(seconds: 7), onTimeout: () => null);
+      debugPrint('🔍 Bluetooth: Iniciando scan...');
+      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 8));
+      return await completer.future.timeout(const Duration(seconds: 9), onTimeout: () => null);
     } finally {
       await FlutterBluePlus.stopScan();
       await _scanSub?.cancel();
@@ -216,63 +281,27 @@ class _ControllerScreenState extends State<ControllerScreen> {
     }
   }
 
-  Future<void> _desconectar({String mensagem = "Pedaleira Desconectada"}) async {
-    _setStatus("Desconectando...");
-    await _connSub?.cancel();
-    _connSub = null;
-    await _scanSub?.cancel();
-    _scanSub = null;
+  Future<void> _connectToDevice(BluetoothDevice device) async {
     try {
-      await FlutterBluePlus.stopScan();
-      await _device?.disconnect();
-    } catch (_) {}
-    if (!mounted) return;
-    setState(() {
-      _device = null;
-      _midiChar = null;
-      _status = mensagem;
-    });
-  }
+      debugPrint('🔗 Bluetooth: Conectando ao dispositivo ${device.platformName}...');
+      await _midiService.connect(device);
 
-  Future<void> _acharMidi() async {
-    if (_device == null) return;
-    final List<BluetoothService> services = await _device!.discoverServices();
-    const List<String> targetServices = ["03b80e5aede84b33a7516ce34ec4c700", "0000fee700001000800000805f9b34fb"];
-    const List<String> targetCharacteristics = ["7772e5db38684112a1a9f2669d106bf3", "0000387200001000800000805f9b34fb"];
+      debugPrint('🔍 Bluetooth: Descobrindo serviços MIDI...');
+      await _midiService.discoverMidiCharacteristic();
 
-    for (final BluetoothService s in services) {
-      final String cleanServiceUuid = s.uuid.str128.replaceAll('-', '').toLowerCase();
-      if (targetServices.contains(cleanServiceUuid)) {
-        for (final BluetoothCharacteristic c in s.characteristics) {
-          final String cleanCharUuid = c.uuid.str128.replaceAll('-', '').toLowerCase();
-          if (targetCharacteristics.contains(cleanCharUuid)) {
-            if (!mounted) return;
-            setState(() {
-              _midiChar = c;
-              _status = "CONECTADO!";
-            });
-            return;
-          }
-        }
-      }
-    }
-    await _desconectar(mensagem: "Canal MIDI não localizado nesta pedaleira");
-  }
-
-  Future<void> _enviarMidi(List<int> bytes) async {
-    if (_midiChar != null) {
-      await _midiChar!.write([0x80, 0x80, ...bytes], withoutResponse: true);
+      _stateManager.setConnectedState(true);
+      _setStatus("CONECTADO!");
+      debugPrint('✅ Bluetooth: Conexão estabelecida com sucesso!');
+    } catch (e) {
+      debugPrint('❌ Bluetooth: Erro de conexão: $e');
+      await _midiService.disconnect();
+      _stateManager.setConnectedState(false);
+      _setStatus("Falha ao conectar. Tente novamente");
     }
   }
 
   Future<void> _mudarPreset(int index) async {
-    setState(() {
-      _activePresetIndex = index;
-      for (final block in _effectsChain) {
-        block.isEnabled = false;
-      }
-    });
-    _enviarMidi([192, _presets[index].blackboxPresetNumber]);
+    await _stateManager.changePreset(index);
   }
 
   void _handleBlockClick(int index) {
@@ -284,12 +313,9 @@ class _ControllerScreenState extends State<ControllerScreen> {
   }
 
   Future<void> _toggleEffect(int index) async {
-    setState(() {
-      _effectsChain[index].isEnabled = !_effectsChain[index].isEnabled;
-    });
-    _enviarMidi([176, _effectsChain[index].ccNumber, 127]);
-    await Future.delayed(const Duration(milliseconds: 60));
-    _enviarMidi([176, _effectsChain[index].ccNumber, 0]);
+    await _stateManager.toggleEffect(index);
+    // Força um rebuild extra para garantir atualização visual
+    if (mounted) setState(() {});
   }
 
   @override
@@ -314,7 +340,7 @@ class _ControllerScreenState extends State<ControllerScreen> {
                       alignment: Alignment.centerRight,
                       child: IconButton(
                         icon: const Icon(Icons.bluetooth),
-                        color: _midiChar != null ? const Color(0xff00e5ff) : Colors.white,
+                        color: _stateManager.isConnected ? const Color(0xff00e5ff) : Colors.white,
                         onPressed: _conectarBlackbox,
                       ),
                     ),
@@ -329,35 +355,55 @@ class _ControllerScreenState extends State<ControllerScreen> {
               Expanded(
                 child: CustomAppLayout.buildGrid(
                   isLandscape,
-                  _presets,
+                  _stateManager.presets,
                   (index) {
-                    final isSelected = _activePresetIndex == index;
-                    return GestureDetector(
+                    final isSelected = _stateManager.activePresetIndex == index;
+                    final preset = _stateManager.presets[index];
+                    return InkWell(
                       onTap: () => _mudarPreset(index),
                       onLongPress: () => _abrirConfiguracaoPreset(index),
+                      splashColor: Colors.white.withValues(alpha: 0.3),
+                      highlightColor: Colors.white.withValues(alpha: 0.2),
+                      borderRadius: BorderRadius.circular(16.0),
                       child: Container(
                         decoration: BoxDecoration(
-                          color: const Color(0xff1e1e1e),
-                          borderRadius: BorderRadius.circular(12.0),
-                          border: Border.all(
-                            color: isSelected ? _presets[index].ledColor : Colors.transparent,
-                            width: 2.5,
+                          gradient: LinearGradient(
+                            begin: Alignment.topLeft,
+                            end: Alignment.bottomRight,
+                            colors: [
+                              preset.ledColor.withValues(alpha: 0.8),
+                              preset.ledColor.withValues(alpha: 0.4),
+                            ],
                           ),
+                          borderRadius: BorderRadius.circular(16.0),
+                          border: Border.all(
+                            color: isSelected ? Colors.white : Colors.white.withValues(alpha: 0.3),
+                            width: isSelected ? 3 : 1,
+                          ),
+                          boxShadow: isSelected
+                              ? [
+                                  BoxShadow(
+                                    color: preset.ledColor.withValues(alpha: 0.8),
+                                    blurRadius: 25,
+                                    spreadRadius: 4,
+                                  ),
+                                  BoxShadow(
+                                    color: Colors.white.withValues(alpha: 0.3),
+                                    blurRadius: 15,
+                                    spreadRadius: 2,
+                                  ),
+                                ]
+                              : [
+                                  BoxShadow(
+                                    color: preset.ledColor.withValues(alpha: 0.3),
+                                    blurRadius: 10,
+                                    spreadRadius: 1,
+                                  ),
+                                ],
                         ),
                         child: Stack(
                           children: [
-                            Positioned(
-                              top: 10,
-                              left: 10,
-                              child: Container(
-                                width: 8,
-                                height: 8,
-                                decoration: BoxDecoration(
-                                  shape: BoxShape.circle,
-                                  color: isSelected ? _presets[index].ledColor : Colors.grey,
-                                ),
-                              ),
-                            ),
+                            // Conteúdo do preset
                             Center(
                               child: Column(
                                 mainAxisAlignment: MainAxisAlignment.center,
@@ -365,18 +411,34 @@ class _ControllerScreenState extends State<ControllerScreen> {
                                   FittedBox(
                                     fit: BoxFit.scaleDown,
                                     child: Text(
-                                      _presets[index].label,
+                                      preset.label,
                                       style: TextStyle(
                                         color: Colors.white,
                                         fontWeight: FontWeight.bold,
-                                        fontSize: isLandscape ? 16 : 18,
+                                        fontSize: isLandscape ? 18 : 22,
+                                        shadows: [
+                                          Shadow(
+                                            color: Colors.black.withValues(alpha: 0.5),
+                                            blurRadius: 8,
+                                          ),
+                                        ],
                                       ),
                                     ),
                                   ),
-                                  const SizedBox(height: 4),
+                                  const SizedBox(height: 6),
                                   Text(
-                                    _presets[index].subLabel,
-                                    style: TextStyle(color: Colors.grey, fontSize: isLandscape ? 11 : 13),
+                                    preset.subLabel,
+                                    style: TextStyle(
+                                      color: Colors.white70,
+                                      fontSize: isLandscape ? 12 : 14,
+                                      fontWeight: FontWeight.w500,
+                                      shadows: [
+                                        Shadow(
+                                          color: Colors.black.withValues(alpha: 0.3),
+                                          blurRadius: 4,
+                                        ),
+                                      ],
+                                    ),
                                   ),
                                 ],
                               ),
@@ -393,14 +455,17 @@ class _ControllerScreenState extends State<ControllerScreen> {
                 height: isLandscape ? 70 : 85,
                 padding: const EdgeInsets.only(bottom: 4),
                 child: Row(
-                  children: List.generate(_effectsChain.length, (index) {
-                    final block = _effectsChain[index];
+                  children: List.generate(_stateManager.effectsChain.length, (index) {
+                    final block = _stateManager.effectsChain[index];
                     bool ledAceso = block.isEnabled;
                     return Expanded(
                       child: Padding(
                         padding: const EdgeInsets.symmetric(horizontal: 4.0),
-                        child: GestureDetector(
+                        child: InkWell(
                           onTap: () => _handleBlockClick(index),
+                          splashColor: Colors.white.withValues(alpha: 0.3),
+                          highlightColor: Colors.white.withValues(alpha: 0.2),
+                          borderRadius: BorderRadius.circular(8.0),
                           child: Container(
                             decoration: BoxDecoration(
                               color: _blockIdPiscando == index ? Colors.white24 : const Color(0xff1a1a1a),
@@ -417,7 +482,7 @@ class _ControllerScreenState extends State<ControllerScreen> {
                                   block.name,
                                   style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.white),
                                 ),
-                                const SizedBox(height: 6),
+                                const SizedBox(height: 12),
                                 Container(
                                   width: 6,
                                   height: 6,
@@ -443,64 +508,143 @@ class _ControllerScreenState extends State<ControllerScreen> {
   }
 
   void _abrirConfiguracaoPreset(int index) {
-    final nCtrl = TextEditingController(text: _presets[index].label);
-    final sCtrl = TextEditingController(text: _presets[index].subLabel);
-    final pCtrl = TextEditingController(text: _presets[index].blackboxPresetNumber.toString());
-    String? erroNumero;
-
-    showDialog(
-      context: context,
-      builder: (dialogContext) => StatefulBuilder(
-        builder: (dialogContext, setDialogState) => AlertDialog(
-          backgroundColor: const Color(0xff1a1a1a),
-          title: Text('Editar ${_presets[index].label}', style: const TextStyle(color: Colors.white)),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextField(controller: nCtrl, decoration: const InputDecoration(labelText: 'Nome do Preset')),
-                TextField(controller: sCtrl, decoration: const InputDecoration(labelText: 'Subtítulo')),
-                TextField(
-                  controller: pCtrl,
-                  keyboardType: TextInputType.number,
-                  decoration: InputDecoration(
-                    labelText: 'Número do Programa MIDI (0 a 127)',
-                    errorText: erroNumero,
+    debugPrint('Abrindo configuração do preset $index');
+    try {
+      final nCtrl = TextEditingController(text: _stateManager.presets[index].label);
+      final sCtrl = TextEditingController(text: _stateManager.presets[index].subLabel);
+      final pCtrl = TextEditingController(text: _stateManager.presets[index].blackboxPresetNumber.toString());
+      
+      // Lista de cores disponíveis estilo Quad Cortex
+      final List<Color> availableColors = [
+        const Color(0xff00ff88), // Verde neon
+        const Color(0xff9d4edd), // Roxo
+        const Color(0xff00d4ff), // Ciano
+        const Color(0xffff6b35), // Laranja
+        const Color(0xffff006e), // Rosa neon
+        const Color(0xff8338ec), // Roxo escuro
+        const Color(0xff3a86ff), // Azul
+        const Color(0xfffb5607), // Laranja escuro
+        const Color(0xffFFD236), // Amarelo
+        const Color(0xff6954FF), // Roxo claro
+        const Color(0xff00FFDD), // Verde água
+        const Color(0xffE44A5D), // Vermelho rosado
+        const Color(0xffFF2727), // Vermelho
+        const Color(0xff87DAFF), // Azul claro
+        const Color(0xffFF7000), // Laranja vibrante
+        const Color(0xff0A74E0), // Azul royal
+        const Color(0xff3500F1), // Índigo
+      ];
+      
+      int selectedColorIndex = availableColors.indexOf(_stateManager.presets[index].ledColor);
+      if (selectedColorIndex == -1) selectedColorIndex = 0;
+      String? erroNumero;
+      
+      showDialog(
+        context: context,
+        builder: (dialogContext) => StatefulBuilder(
+          builder: (context, dialogSetState) => AlertDialog(
+            backgroundColor: const Color(0xff1a1a1a),
+            title: Text('Editar ${_stateManager.presets[index].label}', style: const TextStyle(color: Colors.white)),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(controller: nCtrl, decoration: const InputDecoration(labelText: 'Nome do Preset')),
+                  TextField(controller: sCtrl, decoration: const InputDecoration(labelText: 'Subtítulo')),
+                  TextField(
+                    controller: pCtrl,
+                    keyboardType: TextInputType.number,
+                    decoration: InputDecoration(
+                      labelText: 'Número do Programa MIDI (0 a 127)',
+                      errorText: erroNumero,
+                    ),
                   ),
-                ),
-              ],
+                  const SizedBox(height: 20),
+                  const Text('Cor:', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 10),
+                  SizedBox(
+                    width: double.maxFinite,
+                    child: Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: List.generate(availableColors.length, (colorIndex) {
+                        return GestureDetector(
+                          onTap: () {
+                            dialogSetState(() {
+                              selectedColorIndex = colorIndex;
+                            });
+                          },
+                          child: Container(
+                            width: 50,
+                            height: 50,
+                            decoration: BoxDecoration(
+                              color: availableColors[colorIndex],
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(
+                                color: selectedColorIndex == colorIndex ? Colors.white : Colors.grey,
+                                width: selectedColorIndex == colorIndex ? 3 : 1,
+                              ),
+                              boxShadow: selectedColorIndex == colorIndex
+                                  ? [
+                                      BoxShadow(
+                                        color: availableColors[colorIndex],
+                                        blurRadius: 10,
+                                        spreadRadius: 2,
+                                      ),
+                                    ]
+                                  : null,
+                            ),
+                          ),
+                        );
+                      }),
+                    ),
+                  ),
+                ],
+              ),
             ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext),
+                child: const Text('Sair'),
+              ),
+              TextButton(
+                onPressed: () async {
+                  final int? numero = int.tryParse(pCtrl.text.trim());
+                  if (numero == null || numero < 0 || numero > 127) {
+                    dialogSetState(() => erroNumero = 'Digite um número de 0 a 127');
+                    return;
+                  }
+                  final String nome = nCtrl.text.trim().isEmpty
+                      ? _stateManager.presets[index].label
+                      : nCtrl.text.trim();
+                  final String sub = sCtrl.text.trim();
+                  final Color cor = availableColors[selectedColorIndex];
+
+                  // Atualiza no state manager (fonte de verdade) e na lista local
+                  for (final p in [_stateManager.presets[index], _presets[index]]) {
+                    p.label = nome;
+                    p.subLabel = sub;
+                    p.blackboxPresetNumber = numero;
+                    p.ledColor = cor;
+                  }
+
+                  Navigator.pop(dialogContext);
+                  await _salvarPresetsNoDispositivo();
+                  if (mounted) setState(() {});
+                },
+                child: const Text('Salvar'),
+              ),
+            ],
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext),
-              child: const Text('Sair'),
-            ),
-            TextButton(
-              onPressed: () {
-                final int? numero = int.tryParse(pCtrl.text.trim());
-                if (numero == null || numero < 0 || numero > 127) {
-                  setDialogState(() => erroNumero = 'Digite um número de 0 a 127');
-                  return;
-                }
-                setState(() {
-                  _presets[index].label = nCtrl.text.trim().isEmpty ? _presets[index].label : nCtrl.text.trim();
-                  _presets[index].subLabel = sCtrl.text.trim();
-                  _presets[index].blackboxPresetNumber = numero;
-                });
-                _salvarPresetsNoDispositivo();
-                Navigator.pop(dialogContext);
-              },
-              child: const Text('Salvar'),
-            ),
-          ],
         ),
-      ),
-    ).then((_) {
-      // Só descarta os campos depois que a janela terminou de fechar
-      nCtrl.dispose();
-      sCtrl.dispose();
-      pCtrl.dispose();
-    });
+      ).then((_) {
+        // Só descarta os campos depois que a janela terminou de fechar
+        nCtrl.dispose();
+        sCtrl.dispose();
+        pCtrl.dispose();
+      });
+    } catch (e) {
+      debugPrint('Erro ao abrir configuração: $e');
+    }
   }
 }
