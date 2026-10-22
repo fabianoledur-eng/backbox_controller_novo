@@ -28,6 +28,7 @@ class _QuadCortexAppState extends State<QuadCortexApp> {
   // Carrega o banco em segundo plano sem travar a inicialização do app
   Future<void> _checarAtivacao() async {
     final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
     setState(() {
       _isActivated = prefs.getBool('is_activated') ?? false;
     });

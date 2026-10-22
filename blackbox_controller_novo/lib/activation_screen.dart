@@ -52,6 +52,7 @@ class _ActivationScreenState extends State<ActivationScreen> {
 
     // 2. Verifica se a chave digitada está na lista de usadas
     if (chavesUsadas.contains(chaveDigitada)) {
+      if (!mounted) return;
       setState(() {
         _errorMessage = "Esta chave de licença já foi utilizada.";
         _isLoading = false;
@@ -74,6 +75,7 @@ class _ActivationScreenState extends State<ActivationScreen> {
         MaterialPageRoute(builder: (context) => const ControllerScreen()),
       );
     } else {
+      if (!mounted) return;
       setState(() {
         _errorMessage = "Chave de licença inválida. Verifique os caracteres.";
         _isLoading = false;
@@ -114,9 +116,12 @@ class _ActivationScreenState extends State<ActivationScreen> {
                 TextField(
                   controller: _keyController,
                   textAlign: TextAlign.center,
+                  textCapitalization: TextCapitalization.characters,
+                  autocorrect: false,
+                  onSubmitted: (_) => _isLoading ? null : _verificarChave(),
                   style: const TextStyle(letterSpacing: 2, fontWeight: FontWeight.bold, fontSize: 16),
                   decoration: InputDecoration(
-                    hintText: "X-XXXX-XXXX-XXXX",
+                    hintText: "MVAV-0000-X0",
                     hintStyle: TextStyle(color: Colors.grey.shade600, letterSpacing: 0),
                     filled: true,
                     fillColor: const Color(0xff2a2a2a),

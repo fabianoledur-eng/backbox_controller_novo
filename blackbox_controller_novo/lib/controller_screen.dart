@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -18,6 +19,11 @@ class _ControllerScreenState extends State<ControllerScreen> {
   int _activePresetIndex = 0;
   String _status = "Pedaleira Desconectada";
   int? _blockIdPiscando;
+
+  // Controle da busca/conexão Bluetooth
+  StreamSubscription<List<ScanResult>>? _scanSub;
+  StreamSubscription<BluetoothConnectionState>? _connSub;
+  bool _ocupado = false; // evita várias buscas/conexões ao mesmo tempo
 
   final List<PresetConfig> _presets = [
     PresetConfig(label: 'PRESET A', subLabel: 'Preset 01', blackboxPresetNumber: 0, ledColor: const Color(0xff00e5ff), initialEffectsState: [false, false, false, false, false, false]),
@@ -47,11 +53,16 @@ class _ControllerScreenState extends State<ControllerScreen> {
 
   @override
   void dispose() {
+    _scanSub?.cancel();
+    _connSub?.cancel();
     FlutterBluePlus.stopScan();
-    if (_device != null) {
-      _device!.disconnect();
-    }
+    _device?.disconnect();
     super.dispose();
+  }
+
+  void _setStatus(String texto) {
+    if (!mounted) return;
+    setState(() => _status = texto);
   }
 
   Future<void> _carregarPresetsSalvos() async {
@@ -61,6 +72,7 @@ class _ControllerScreenState extends State<ControllerScreen> {
     if (presetsJson != null) {
       try {
         final List<dynamic> decodedList = jsonDecode(presetsJson);
+        if (!mounted) return;
         setState(() {
           for (int i = 0; i < decodedList.length && i < _presets.length; i++) {
             _presets[i].label = decodedList[i]['label'] ?? _presets[i].label;
@@ -87,66 +99,164 @@ class _ControllerScreenState extends State<ControllerScreen> {
     await prefs.setString('saved_presets_data', jsonEncode(listaParaSalvar));
   }
 
-  void _conectarBlackbox() async {
-    if (_device != null || _midiChar != null || _status == "Buscando...") {
-      setState(() => _status = "Desconectando...");
-      await FlutterBluePlus.stopScan();
-
-      if (_device != null) {
-        await _device!.disconnect();
-      }
-
-      setState(() {
-        _device = null;
-        _midiChar = null;
-        _status = "Pedaleira Desconectada";
-      });
+  // Botão de Bluetooth: conecta se estiver desconectado, desconecta se estiver conectado
+  Future<void> _conectarBlackbox() async {
+    if (_ocupado) return;
+    if (_device != null || _midiChar != null) {
+      await _desconectar();
       return;
     }
 
-    setState(() => _status = "Buscando...");
-    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 4));
-    FlutterBluePlus.scanResults.listen((results) async {
-      for (final ScanResult r in results) {
-        final String advName = r.advertisementData.advName.toUpperCase();
-        if (advName.contains('M-VAVE') || advName.contains('BLACKBOX')) {
-          await FlutterBluePlus.stopScan();
-          _device = r.device;
-          setState(() => _status = "Conectando...");
-          await _device!.connect();
-          _acharMidi();
-          break;
-        }
+    _ocupado = true;
+    try {
+      // 1. O aparelho tem Bluetooth?
+      if (!await FlutterBluePlus.isSupported) {
+        _setStatus("Este aparelho não tem Bluetooth");
+        return;
       }
+
+      // 2. O Bluetooth está ligado? (no Android tenta ligar sozinho)
+      if (!await _bluetoothLigado()) {
+        _setStatus("Ligue o Bluetooth do celular e tente de novo");
+        return;
+      }
+
+      // 3. Procura a pedaleira (máx. 6 segundos)
+      _setStatus("Buscando...");
+      final BluetoothDevice? encontrado = await _procurarPedaleira();
+      if (encontrado == null) {
+        _setStatus("Pedaleira não encontrada. Ligue-a e tente de novo");
+        return;
+      }
+
+      // 4. Conecta
+      _device = encontrado;
+      _setStatus("Conectando...");
+      await encontrado.connect(timeout: const Duration(seconds: 10));
+
+      // 5. Avisa se a conexão cair (pedaleira desligada, fora de alcance...)
+      await _connSub?.cancel();
+      _connSub = encontrado.connectionState.listen((estado) {
+        if (estado == BluetoothConnectionState.disconnected && _device != null) {
+          _connSub?.cancel();
+          _connSub = null;
+          if (!mounted) return;
+          setState(() {
+            _device = null;
+            _midiChar = null;
+            _status = "Conexão perdida. Toque no Bluetooth para reconectar";
+          });
+        }
+      });
+
+      // 6. Encontra o canal MIDI
+      await _acharMidi();
+    } catch (e) {
+      debugPrint("Erro ao conectar: $e");
+      await _desconectar(mensagem: "Falha ao conectar. Tente novamente");
+    } finally {
+      _ocupado = false;
+    }
+  }
+
+  Future<bool> _bluetoothLigado() async {
+    BluetoothAdapterState estado = await FlutterBluePlus.adapterState
+        .where((s) => s != BluetoothAdapterState.unknown)
+        .first
+        .timeout(const Duration(seconds: 3), onTimeout: () => BluetoothAdapterState.unknown);
+
+    if (estado == BluetoothAdapterState.on) return true;
+
+    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+      try {
+        await FlutterBluePlus.turnOn(); // mostra o pedido do sistema para ligar o Bluetooth
+        estado = await FlutterBluePlus.adapterState
+            .where((s) => s == BluetoothAdapterState.on)
+            .first
+            .timeout(const Duration(seconds: 5), onTimeout: () => BluetoothAdapterState.off);
+        return estado == BluetoothAdapterState.on;
+      } catch (_) {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  Future<BluetoothDevice?> _procurarPedaleira() async {
+    final completer = Completer<BluetoothDevice?>();
+
+    await _scanSub?.cancel();
+    _scanSub = FlutterBluePlus.onScanResults.listen(
+      (results) {
+        for (final ScanResult r in results) {
+          final String nome = (r.advertisementData.advName.isNotEmpty
+                  ? r.advertisementData.advName
+                  : r.device.platformName)
+              .toUpperCase();
+          if ((nome.contains('M-VAVE') || nome.contains('BLACKBOX')) && !completer.isCompleted) {
+            completer.complete(r.device);
+            return;
+          }
+        }
+      },
+      onError: (e) {
+        if (!completer.isCompleted) completer.complete(null);
+      },
+    );
+
+    try {
+      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 6));
+      // startScan com timeout só termina quando a busca acaba;
+      // se a pedaleira foi achada antes, o completer já tem o resultado.
+      return await completer.future.timeout(const Duration(seconds: 7), onTimeout: () => null);
+    } finally {
+      await FlutterBluePlus.stopScan();
+      await _scanSub?.cancel();
+      _scanSub = null;
+    }
+  }
+
+  Future<void> _desconectar({String mensagem = "Pedaleira Desconectada"}) async {
+    _setStatus("Desconectando...");
+    await _connSub?.cancel();
+    _connSub = null;
+    await _scanSub?.cancel();
+    _scanSub = null;
+    try {
+      await FlutterBluePlus.stopScan();
+      await _device?.disconnect();
+    } catch (_) {}
+    if (!mounted) return;
+    setState(() {
+      _device = null;
+      _midiChar = null;
+      _status = mensagem;
     });
   }
 
-  void _acharMidi() async {
+  Future<void> _acharMidi() async {
     if (_device == null) return;
-    try {
-      final List<BluetoothService> services = await _device!.discoverServices();
-      final List<String> targetServices = ["03b80e5aede84b33a7516ce34ec4c700", "0000fee700001000800000805f9b34fb"];
-      final List<String> targetCharacteristics = ["7772e5db38684112a1a9f2669d106bf3", "0000387200001000800000805f9b34fb"];
+    final List<BluetoothService> services = await _device!.discoverServices();
+    const List<String> targetServices = ["03b80e5aede84b33a7516ce34ec4c700", "0000fee700001000800000805f9b34fb"];
+    const List<String> targetCharacteristics = ["7772e5db38684112a1a9f2669d106bf3", "0000387200001000800000805f9b34fb"];
 
-      for (final BluetoothService s in services) {
-        final String cleanServiceUuid = s.uuid.toString().replaceAll('-', '').toLowerCase();
-        if (targetServices.contains(cleanServiceUuid)) {
-          for (final BluetoothCharacteristic c in s.characteristics) {
-            final String cleanCharUuid = c.uuid.toString().replaceAll('-', '').toLowerCase();
-            if (targetCharacteristics.contains(cleanCharUuid)) {
-              setState(() {
-                _midiChar = c;
-                _status = "CONECTADO!";
-              });
-              return;
-            }
+    for (final BluetoothService s in services) {
+      final String cleanServiceUuid = s.uuid.str128.replaceAll('-', '').toLowerCase();
+      if (targetServices.contains(cleanServiceUuid)) {
+        for (final BluetoothCharacteristic c in s.characteristics) {
+          final String cleanCharUuid = c.uuid.str128.replaceAll('-', '').toLowerCase();
+          if (targetCharacteristics.contains(cleanCharUuid)) {
+            if (!mounted) return;
+            setState(() {
+              _midiChar = c;
+              _status = "CONECTADO!";
+            });
+            return;
           }
         }
       }
-      setState(() => _status = "Canal MIDI não localizado");
-    } catch (e) {
-      setState(() => _status = "Erro de leitura: $e");
     }
+    await _desconectar(mensagem: "Canal MIDI não localizado nesta pedaleira");
   }
 
   Future<void> _enviarMidi(List<int> bytes) async {
@@ -168,7 +278,7 @@ class _ControllerScreenState extends State<ControllerScreen> {
   void _handleBlockClick(int index) {
     setState(() => _blockIdPiscando = index);
     Future.delayed(const Duration(milliseconds: 120), () {
-      setState(() => _blockIdPiscando = null);
+      if (mounted) setState(() => _blockIdPiscando = null);
     });
     _toggleEffect(index);
   }
@@ -336,51 +446,61 @@ class _ControllerScreenState extends State<ControllerScreen> {
     final nCtrl = TextEditingController(text: _presets[index].label);
     final sCtrl = TextEditingController(text: _presets[index].subLabel);
     final pCtrl = TextEditingController(text: _presets[index].blackboxPresetNumber.toString());
+    String? erroNumero;
+
     showDialog(
       context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xff1a1a1a),
-        title: Text('Editar ${_presets[index].label}', style: const TextStyle(color: Colors.white)),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(controller: nCtrl, decoration: const InputDecoration(labelText: 'Nome do Preset')),
-              TextField(controller: sCtrl, decoration: const InputDecoration(labelText: 'Subtítulo')),
-              TextField(
-                controller: pCtrl,
-                keyboardType: TextInputType.number,
-                decoration: const InputDecoration(labelText: 'Número do Programa MIDI'),
-              ),
-            ],
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) => AlertDialog(
+          backgroundColor: const Color(0xff1a1a1a),
+          title: Text('Editar ${_presets[index].label}', style: const TextStyle(color: Colors.white)),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(controller: nCtrl, decoration: const InputDecoration(labelText: 'Nome do Preset')),
+                TextField(controller: sCtrl, decoration: const InputDecoration(labelText: 'Subtítulo')),
+                TextField(
+                  controller: pCtrl,
+                  keyboardType: TextInputType.number,
+                  decoration: InputDecoration(
+                    labelText: 'Número do Programa MIDI (0 a 127)',
+                    errorText: erroNumero,
+                  ),
+                ),
+              ],
+            ),
           ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('Sair'),
+            ),
+            TextButton(
+              onPressed: () {
+                final int? numero = int.tryParse(pCtrl.text.trim());
+                if (numero == null || numero < 0 || numero > 127) {
+                  setDialogState(() => erroNumero = 'Digite um número de 0 a 127');
+                  return;
+                }
+                setState(() {
+                  _presets[index].label = nCtrl.text.trim().isEmpty ? _presets[index].label : nCtrl.text.trim();
+                  _presets[index].subLabel = sCtrl.text.trim();
+                  _presets[index].blackboxPresetNumber = numero;
+                });
+                _salvarPresetsNoDispositivo();
+                Navigator.pop(dialogContext);
+              },
+              child: const Text('Salvar'),
+            ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () {
-              nCtrl.dispose();
-              sCtrl.dispose();
-              pCtrl.dispose();
-              Navigator.pop(context);
-            },
-            child: const Text('Sair'),
-          ),
-          TextButton(
-            onPressed: () {
-              _presets[index].label = nCtrl.text;
-              _presets[index].subLabel = sCtrl.text;
-              _presets[index].blackboxPresetNumber = int.tryParse(pCtrl.text) ?? _presets[index].blackboxPresetNumber;
-              _salvarPresetsNoDispositivo();
-              nCtrl.dispose();
-              sCtrl.dispose();
-              pCtrl.dispose();
-              Navigator.pop(context);
-              setState(() {});
-            },
-            child: const Text('Salvar'),
-          ),
-        ],
       ),
-    );
+    ).then((_) {
+      // Só descarta os campos depois que a janela terminou de fechar
+      nCtrl.dispose();
+      sCtrl.dispose();
+      pCtrl.dispose();
+    });
   }
 }
